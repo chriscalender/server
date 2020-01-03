@@ -41,7 +41,7 @@ bool stmt_has_updated_non_trans_table(const THD* thd);
 class TC_LOG
 {
   public:
-  int using_heuristic_recover();
+  int using_heuristic_recover(const char* opt_name);
   TC_LOG() {}
   virtual ~TC_LOG() {}
 
@@ -651,6 +651,7 @@ public:
   */
   char last_commit_pos_file[FN_REFLEN];
   my_off_t last_commit_pos_offset;
+  my_xid last_rolled_back_xid;
   ulong current_binlog_id;
 
   MYSQL_BIN_LOG(uint *sync_period);
@@ -681,6 +682,7 @@ public:
                     bool need_prepare_ordered, bool need_commit_ordered);
   int unlog(ulong cookie, my_xid xid);
   void commit_checkpoint_notify(void *cookie);
+  int heuristic_binlog_rollback(const char* opt_name);
   int recover(LOG_INFO *linfo, const char *last_log_name, IO_CACHE *first_log,
               Format_description_log_event *fdle, bool do_xa);
   int do_binlog_recovery(const char *opt_name, bool do_xa_recovery);
@@ -803,6 +805,7 @@ public:
 		   bool need_mutex);
   int find_next_log(LOG_INFO* linfo, bool need_mutex);
   int get_current_log(LOG_INFO* linfo);
+  int get_binlog_checkpoint_file(const char*, char*);
   int raw_get_current_log(LOG_INFO* linfo);
   uint next_file_id();
   inline char* get_index_fname() { return index_file_name;}

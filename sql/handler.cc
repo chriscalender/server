@@ -1938,6 +1938,7 @@ static my_bool xarecover_handlerton(THD *unused, plugin_ref plugin,
         }
         else
         {
+          mysql_bin_log.last_rolled_back_xid= x;
 #ifndef DBUG_OFF
           int rc=
 #endif

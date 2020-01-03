@@ -8969,7 +8969,7 @@ int TC_LOG_MMAP::open(const char *opt_name)
   {
     if (my_errno != ENOENT)
       goto err;
-    if (using_heuristic_recover())
+    if (using_heuristic_recover(opt_name))
       return 1;
     if ((fd= mysql_file_create(key_file_tclog, logname, CREATE_MODE,
                                O_RDWR | O_CLOEXEC, MYF(MY_WME))) < 0)
@@ -9502,7 +9502,7 @@ TC_LOG_MMAP  tc_log_mmap;
     1   heuristic recovery was performed
 */
 
-int TC_LOG::using_heuristic_recover()
+int TC_LOG::using_heuristic_recover(const char* opt_name)
 {
   if (!tc_heuristic_recover)
     return 0;
@@ -9510,13 +9510,286 @@ int TC_LOG::using_heuristic_recover()
   sql_print_information("Heuristic crash recovery mode");
   if (ha_recover(0))
     sql_print_error("Heuristic crash recovery failed");
+
+  /*
+     Check if TC log is referring to binary log not memory map.
+     Ensure that tc_heuristic_recover being ROLLBACK". If both match initiate
+     binlog truncation mechanism.
+  */
+  if (!strcmp(opt_name,opt_bin_logname) &&
+      tc_heuristic_recover == TC_HEURISTIC_RECOVER_ROLLBACK)
+  {
+    mysql_bin_log.heuristic_binlog_rollback(opt_name);
+  }
+
   sql_print_information("Please restart mysqld without --tc-heuristic-recover");
   return 1;
 }
 
+
 /****** transaction coordinator log for 2pc - binlog() based solution ******/
 #define TC_LOG_BINLOG MYSQL_BIN_LOG
 
+int TC_LOG_BINLOG::get_binlog_checkpoint_file(const char* opt_name,
+    char* checkpoint_file)
+{
+  Log_event *ev= NULL;
+  char binlog_checkpoint_name[FN_REFLEN];
+  bool binlog_checkpoint_found= false;
+  LOG_INFO log_info;
+  const char *errmsg;
+  IO_CACHE    log;
+  File        file;
+  Format_description_log_event fdle(BINLOG_VERSION);
+  char        log_name[FN_REFLEN];
+  int error;
+
+  if ((error= find_log_pos(&log_info, NullS, 1)))
+  {
+    sql_print_error("find_log_pos() failed (error: %d)", error);
+    return error;
+  }
+
+  if (!fdle.is_valid())
+    return 1;
+  // Move to the last binary log.
+  do
+  {
+    strmake_buf(log_name, log_info.log_file_name);
+  } while (!(error= find_next_log(&log_info, 1)));
+
+  if (error !=  LOG_INFO_EOF)
+  {
+    sql_print_error("find_log_pos() failed (error: %d)", error);
+    return error;
+  }
+  if ((file= open_binlog(&log, log_name, &errmsg)) < 0)
+  {
+    sql_print_error("%s", errmsg);
+    return 1;
+  }
+  while ((ev= Log_event::read_log_event(&log, 0, &fdle,
+          opt_master_verify_checksum)) &&
+      ev->is_valid())
+  {
+    enum Log_event_type typ= ev->get_type_code();
+    if (typ == BINLOG_CHECKPOINT_EVENT)
+    {
+      uint dir_len;
+      Binlog_checkpoint_log_event *cev= (Binlog_checkpoint_log_event *)ev;
+      if (cev->binlog_file_len >= FN_REFLEN)
+      {
+        sql_print_error("Incorrect binlog checkpoint event with too "
+            "long file name found.");
+        delete ev;
+        ev= NULL;
+        return 1;
+      }
+      else
+      {
+        dir_len= dirname_length(log_name);
+        strmake(strnmov(binlog_checkpoint_name, log_name, dir_len),
+            cev->binlog_file_name, FN_REFLEN - 1 - dir_len);
+        binlog_checkpoint_found= true;
+      }
+    }
+    delete ev;
+    ev= NULL;
+  } // End of while
+  end_io_cache(&log);
+  mysql_file_close(file, MYF(MY_WME));
+  file= -1;
+  /*
+     Old binary log without checkpoint found, binlog truncation is not
+     possible. Hence return error.
+   */
+  if (!binlog_checkpoint_found)
+    return 1;
+  else
+  {
+    // Look for binlog checkpoint file in binlog index file.
+    if (find_log_pos(&log_info, binlog_checkpoint_name, 1))
+    {
+      sql_print_error("Binlog file '%s' not found in binlog index, needed "
+          "for recovery. Aborting.", binlog_checkpoint_name);
+      return 1;
+    }
+    strmake(checkpoint_file, log_name, FN_REFLEN-1);
+  }
+  fdle.reset_crypto();
+  return 0;
+}
+
+int TC_LOG_BINLOG::heuristic_binlog_rollback(const char* opt_name)
+{
+  Log_event *ev= NULL;
+  char checkpoint_file[FN_REFLEN];
+  char valid_binlog_file[FN_REFLEN];
+  my_off_t valid_binlog_pos=0;
+  LOG_INFO log_info;
+  const char *errmsg;
+  IO_CACHE    log;
+  File        file;
+  Format_description_log_event fdle(BINLOG_VERSION);
+  int error;
+  bool gtid_state_recovery_done= false;
+  MY_STAT s;
+  my_off_t binlog_size;
+#ifdef HAVE_REPLICATION
+  rpl_gtid last_gtid;
+  bool last_gtid_standalone= false;
+  bool last_gtid_valid= false;
+#endif
+
+  if (!mysql_bin_log.last_rolled_back_xid)
+    return 0;
+  if ((error= get_binlog_checkpoint_file(opt_name, checkpoint_file)))
+      return error;
+
+  if ((error= find_log_pos(&log_info, checkpoint_file, 1)))
+  {
+    sql_print_error("find_log_pos() failed (error: %d)", error);
+    return error;
+  }
+
+  if ((file= open_binlog(&log, log_info.log_file_name, &errmsg)) < 0)
+  {
+    sql_print_error("Failed to open the binlog checkpoint file:%s for recovery."
+                    "Error: %s", checkpoint_file, errmsg);
+    return 1;
+  }
+  strmake(valid_binlog_file, log_info.log_file_name, FN_REFLEN-1);
+  my_stat(valid_binlog_file, &s, MYF(0));
+  binlog_size= s.st_size;
+  fprintf(stderr, "Valid_binlog_file:%s binlog_size:%lld\n", valid_binlog_file,
+      binlog_size);
+
+  while ((ev= Log_event::read_log_event(&log, 0, &fdle,
+          opt_master_verify_checksum)) && ev->is_valid())
+  {
+    enum Log_event_type typ= ev->get_type_code();
+    switch (typ)
+    {
+      case XID_EVENT:
+        {
+          Xid_log_event *xev=(Xid_log_event *)ev;
+          if (xev->xid == mysql_bin_log.last_rolled_back_xid)
+            gtid_state_recovery_done=true;
+          break;
+        }
+      case GTID_LIST_EVENT:
+        {
+          Gtid_list_log_event *glev= (Gtid_list_log_event *)ev;
+
+          /* Initialise the binlog state from the Gtid_list event. */
+          if (rpl_global_gtid_binlog_state.load(glev->list, glev->count))
+            goto err2;
+        }
+        break;
+
+#ifdef HAVE_REPLICATION
+      case GTID_EVENT:
+        {
+          Gtid_log_event *gev= (Gtid_log_event *)ev;
+          if ((gev->flags2 & Gtid_log_event::FL_DDL ||
+                gev->flags2 & Gtid_log_event::FL_TRANSACTIONAL))
+          {
+            /* Update the binlog state with any GTID logged after Gtid_list. */
+            last_gtid.domain_id= gev->domain_id;
+            last_gtid.server_id= gev->server_id;
+            last_gtid.seq_no= gev->seq_no;
+            last_gtid_standalone=
+              ((gev->flags2 & Gtid_log_event::FL_STANDALONE) ? true : false);
+            last_gtid_valid= true;
+          }
+          else
+          {
+            sql_print_error("Non transactional changes are found safe binlog"
+                "rollback is not possible, hence aborting the binlog rollback.");
+            goto err2;
+          }
+        }
+        break;
+#endif
+      case START_ENCRYPTION_EVENT:
+        {
+          if (fdle.start_decryption((Start_encryption_log_event*) ev))
+            goto err2;
+        }
+        break;
+
+      default:
+        /* Nothing. */
+        break;
+    }
+#ifdef HAVE_REPLICATION
+    if (!gtid_state_recovery_done && last_gtid_valid &&
+        ((last_gtid_standalone && !ev->is_part_of_group(typ)) ||
+         (!last_gtid_standalone &&
+          (typ == XID_EVENT ||
+           (typ == QUERY_EVENT &&
+            (((Query_log_event *)ev)->is_commit() ||
+             ((Query_log_event *)ev)->is_rollback()))))))
+    {
+      if (rpl_global_gtid_binlog_state.update_nolock(&last_gtid, false))
+        goto err2;
+      valid_binlog_pos= ev->log_pos;
+      fprintf(stderr,"Valid_binlog_pos: %lld\n", valid_binlog_pos);
+      last_gtid_valid= false;
+    }
+#endif
+    delete ev;
+    ev= NULL;
+  }
+  end_io_cache(&log);
+  mysql_file_close(file, MYF(MY_WME));
+
+  if (!gtid_state_recovery_done)
+    goto err2;
+  else
+  {
+    if (valid_binlog_pos)
+    {
+      if ((file= mysql_file_open(key_file_binlog, valid_binlog_file,
+              O_RDWR | O_BINARY, MYF(MY_WME))) < 0)
+      {
+        sql_print_error("Failed to open the crashed binlog file "
+            "when master server is recovering it.");
+        return -1;
+      }
+
+      /* Change binlog file size to valid_pos */
+      if (my_chsize(file, valid_binlog_pos, 0, MYF(MY_WME)))
+      {
+        sql_print_error("Failed to trim the crashed binlog file "
+            "when master server is recovering it.");
+        mysql_file_close(file, MYF(MY_WME));
+        return -1;
+      }
+      else
+      {
+        sql_print_information("Crashed binlog file %s size is %llu, "
+            "but recovered up to %llu. Binlog trimmed to %llu bytes.",
+            valid_binlog_file, binlog_size, valid_binlog_pos, valid_binlog_pos);
+      }
+    }
+  }
+  mysql_file_close(file, MYF(MY_WME));
+	return 0;
+
+err2:
+  sql_print_error("Rolled back xid:%lu not found in recovery binlog:%s\n",
+      checkpoint_file);
+  read_state_from_file();
+  delete ev;
+  if (file >= 0)
+  {
+    end_io_cache(&log);
+    mysql_file_close(file, MYF(MY_WME));
+  }
+  return 1;
+
+}
 int TC_LOG_BINLOG::open(const char *opt_name)
 {
   int      error= 1;
@@ -9531,7 +9804,7 @@ int TC_LOG_BINLOG::open(const char *opt_name)
     return 1;
   }
 
-  if (using_heuristic_recover())
+  if (using_heuristic_recover(opt_name))
   {
     mysql_mutex_lock(&LOCK_log);
     /* generate a new binlog to mask a corrupted one */
